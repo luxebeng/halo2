@@ -21,11 +21,7 @@ trait NumericInstructions<F: Field>: Chip<F> {
     fn load_constant(&self, layouter: impl Layouter<F>, constant: F) -> Result<Self::Num, Error>;
 
     /// Returns `c = a * b`.
-    fn is_zero(
-        &self,
-        layouter: impl Layouter<F>,
-        a: Self::Num,
-    ) -> Result<Self::Num, Error>;
+    fn is_zero(&self, layouter: impl Layouter<F>, a: Self::Num) -> Result<Self::Num, Error>;
 
     /// Exposes a number as a public input to the circuit.
     fn expose_public(
@@ -97,10 +93,6 @@ impl<F: Field> FieldChip<F> {
             // |  in  | invert | s_is_zero |
             // |  out |        |           |
             //
-            // Gates may refer to any relative offsets we want, but each distinct
-            // offset adds a cost to the proof. The most common offsets are 0 (the
-            // current row), 1 (the next row), and -1 (the previous row), for which
-            // `Rotation` has specific constructors.
             let input = meta.query_advice(advice[0], Rotation::cur());
             let invert = meta.query_advice(advice[1], Rotation::cur());
             let out = meta.query_advice(advice[0], Rotation::next());
@@ -115,7 +107,9 @@ impl<F: Field> FieldChip<F> {
             vec![
                 is_zero.clone() * out.clone() * (Expression::Constant(F::ONE) - out.clone()),
                 is_zero.clone() * out.clone() * input.clone(),
-                is_zero.clone() * (Expression::Constant(F::ONE) - out) * (Expression::Constant(F::ONE) - input.clone() * invert.clone()),
+                is_zero.clone()
+                    * (Expression::Constant(F::ONE) - out)
+                    * (Expression::Constant(F::ONE) - input.clone() * invert.clone()),
                 is_zero * input.clone() * (Expression::Constant(F::ONE) - input * invert),
             ]
         });
@@ -186,39 +180,23 @@ impl<F: Field> NumericInstructions<F> for FieldChip<F> {
         )
     }
 
-    fn is_zero(
-        &self,
-        mut layouter: impl Layouter<F>,
-        a: Self::Num,
-    ) -> Result<Self::Num, Error> {
+    fn is_zero(&self, mut layouter: impl Layouter<F>, a: Self::Num) -> Result<Self::Num, Error> {
         let config = self.config();
 
         layouter.assign_region(
             || "is_zero",
             |mut region: Region<'_, F>| {
-                // We only want to use a single multiplication gate in this region,
-                // so we enable it at region offset 0; this means it will constrain
-                // cells at offsets 0 and 1.
                 config.s_is_zero.enable(&mut region, 0)?;
 
-                // The inputs we've been given could be located anywhere in the circuit,
-                // but we can only rely on relative offsets inside this region. So we
-                // assign new cells inside the region and constrain them to have the
-                // same values as the inputs.
-                a.0.copy_advice(|| "lhs", &mut region, config.advice[0], 0)?;
-                let revert = a.0.value().map(|v| v.invert().unwrap_or(F::ZERO));
-                region.assign_advice(|| "invert(a)", config.advice[1], 0, || revert)?;
+                a.0.copy_advice(|| "input", &mut region, config.advice[0], 0)?;
+                let v = a.0.value().map(|v| v.invert().unwrap_or(F::ZERO));
+                region.assign_advice(|| "invert(a)", config.advice[1], 0, || v)?;
 
-                // Now we can assign the result, which is to be assigned
-                // into the output position.
-                let value =
+                let v =
                     a.0.value()
                         .map(|v| if *v == F::ZERO { F::ONE } else { F::ZERO });
-
-                // Finally, we do the assignment to the output, returning a
-                // variable to be used in another part of the circuit.
                 region
-                    .assign_advice(|| "is_zero(a)", config.advice[0], 1, || value)
+                    .assign_advice(|| "is_zero(a)", config.advice[0], 1, || v)
                     .map(Number)
             },
         )
@@ -240,22 +218,15 @@ impl<F: Field> NumericInstructions<F> for FieldChip<F> {
 // ANCHOR: circuit
 /// The full circuit implementation.
 ///
-/// In this struct we store the private input variables. We use `Option<F>` because
-/// they won't have any value during key generation. During proving, if any of these
-/// were `None` we would get an error.
 #[derive(Default)]
 struct MyCircuit<F: Field> {
-    //constant: F,
     a: Value<F>,
-    //b: Value<F>,
 }
 
 impl<F: Field> Circuit<F> for MyCircuit<F> {
     // Since we are using a single chip for everything, we can just reuse its config.
     type Config = FieldConfig;
     type FloorPlanner = SimpleFloorPlanner;
-    #[cfg(feature = "circuit-params")]
-    type Params = ();
 
     fn without_witnesses(&self) -> Self {
         Self::default()
@@ -284,12 +255,6 @@ impl<F: Field> Circuit<F> for MyCircuit<F> {
 
         // Load our private values into the circuit.
         let a = field_chip.load_private(layouter.namespace(|| "load a"), self.a)?;
-        //let b = field_chip.load_private(layouter.namespace(|| "load b"), self.b)?;
-
-        // Load the constant factor into the circuit.
-        // let constant =
-        //     field_chip.load_constant(layouter.namespace(|| "load constant"), self.constant)?;
-
         let c = field_chip.is_zero(layouter.namespace(|| "is_zero"), a)?;
 
         // Expose the result as a public input to the circuit.
@@ -302,56 +267,39 @@ fn main() {
     use halo2_proofs::dev::MockProver;
     use halo2curves::pasta::Fp;
 
-    // ANCHOR: test-circuit
-    // The number of rows in our circuit cannot exceed 2^k. Since our example
-    // circuit is very small, we can pick a very small value here.
     let k = 4;
 
     // case 0 : input == 0 and output ==1
-    let a = Fp::from(0);
-    let c = if a == Fp::ZERO { Fp::ONE } else { Fp::ZERO };
     let circuit = MyCircuit {
-        a: Value::known(a),
+        a: Value::known(Fp::ZERO),
     };
-    let mut public_inputs = vec![c];
-    let prover = MockProver::run(k, &circuit, vec![public_inputs.clone()]).unwrap();
-    assert_eq!(prover.verify(), Ok(()));
-
-    // If we try some other public input, the proof will fail!
-    public_inputs[0] += Fp::one();
+    let public_inputs = vec![Fp::ONE];
     let prover = MockProver::run(k, &circuit, vec![public_inputs]).unwrap();
-    assert!(prover.verify().is_err());
-    // ANCHOR_END: test-circuit
+    assert_eq!(prover.verify(), Ok(()));
 
     // case 1 : (input == 2 and output == 0)
-    let a = Fp::from(2);
-    let c = Fp::ZERO;
     let circuit = MyCircuit {
-        a: Value::known(a),
+        a: Value::known(Fp::from(2)),
     };
-    let public_inputs = vec![c];
+    let public_inputs = vec![Fp::ZERO];
     let prover = MockProver::run(k, &circuit, vec![public_inputs]).unwrap();
     assert_eq!(prover.verify(), Ok(()));
-    
+
     // case 2 : (input == 0 and output == 2)
     // error case to ensure output is bool
-    let a = Fp::from(0);
-    let c = Fp::from(2);
     let circuit = MyCircuit {
-        a: Value::known(a),
+        a: Value::known(Fp::ZERO),
     };
-    let public_inputs = vec![c];
+    let public_inputs = vec![Fp::from(2)];
     let prover = MockProver::run(k, &circuit, vec![public_inputs]).unwrap();
     assert!(prover.verify().is_err());
 
     // case 3: (input == 0 and output == 0)
-    // error case to avoid both input and output is 0 
-    let a = Fp::from(0);
-    let c = Fp::from(0);
+    // error case to avoid both input and output is 0
     let circuit = MyCircuit {
-        a: Value::known(a),
+        a: Value::known(Fp::ZERO),
     };
-    let public_inputs = vec![c];
+    let public_inputs = vec![Fp::ZERO];
     let prover = MockProver::run(k, &circuit, vec![public_inputs]).unwrap();
     assert!(prover.verify().is_err());
 }
